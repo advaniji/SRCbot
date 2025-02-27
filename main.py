@@ -1,117 +1,212 @@
-import os
-import re
+import os as os_module, re as regex
+from pyrogram import Client as TelegramClient, filters as Filters
+from pyrogram.types import Message as TelegramMessage
 import time
-import random
-import string
-from pyrogram import Client, filters, types
-from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton
-from config import API_ID, API_HASH, BOT_TOKEN
+from config import API_ID, API_HASH, BOT_TOKEN, SESSION_STRING
 
-# Initialize clients
-userbot = Client("userbot", api_id=API_ID, api_hash=API_HASH)
-bot = Client("bot", bot_token=BOT_TOKEN)
+bot_client = TelegramClient("bot", API_ID, API_HASH, bot_token=BOT_TOKEN)
+user_client = TelegramClient("user", API_ID, API_HASH, session_string=SESSION_STRING)
 
-# Global variables
+user_states = {}
+active_tasks = {}
 progress_cache = {}
 
-def generate_random_name(length=7):
-    characters = string.ascii_letters + string.digits
-    return ''.join(random.choice(characters) for _ in range(length))
+try:
+    user_client.start()
+    print("User client started successfully")
+except Exception as e:
+    print(f"Failed to start user client: {e}")
+    exit(1)
 
-def parse_link(link: str):
-    pattern = r"https?://t\.me/(?:c/|(?:\w+/)?)(\d+|[^\s/]+)/(\d+)"
-    match = re.match(pattern, link)
-    if not match:
-        return None, None, None
+def parse_telegram_link(link):
+    """Extract chat information from Telegram message link"""
+    private_chat_match = regex.match(r"https://t\.me/c/(\d+)/(\d+)", link)
+    public_chat_match = regex.match(r"https://t\.me/([^/]+)/(\d+)", link)
     
-    chat_part, msg_id = match.groups()
+    if private_chat_match:
+        return f"-100{private_chat_match.group(1)}", int(private_chat_match.group(2)), "private"
+    if public_chat_match:
+        return public_chat_match.group(1), int(public_chat_match.group(2)), "public"
+    return None, None, None
+        
+async def fetch_message(client, chat_id, message_id, link_type):
+    """Retrieve message from specified chat"""
     try:
-        chat_id = int(chat_part) if chat_part.isdigit() else chat_part
-        msg_id = int(msg_id)
-    except ValueError:
-        return None, None, None
-    
-    link_type = "channel" if chat_part.isdigit() else "group" if chat_part.startswith("-") else "private"
-    return chat_id, msg_id, link_type
-
-@bot.on_message(filters.command("start"))
-async def start(_, message):
-    await message.reply_text("Welcome to the bot! Use /batch to start processing.")
-
-@bot.on_message(filters.command("batch"))
-async def batch(_, message):
-    await message.reply_text("Send the start link.")
-
-@bot.on_message(filters.command("cancel"))
-async def cancel(_, message):
-    await message.reply_text("Cancelling...")
-
-@bot.on_message(filters.text & ~filters.command(["start", "batch", "cancel"]))
-async def handle_text(_, message):
-    if message.text.startswith("http"):
-        chat_id, msg_id, link_type = parse_link(message.text)
-        if not chat_id or not msg_id:
-            await message.reply_text("Invalid link. Please check the format.")
-            return
-        await message.reply_text("How many messages?")
-
-@bot.on_message(filters.command("login"))
-async def generate_session(_, message):
-    user_id = message.chat.id
-    number = await _.ask(user_id, 'Please enter your phone number along with the country code.\nExample: +19876543210', filters=filters.text)
-    phone_number = number.text
-
-    try:
-        await message.reply("📲 Sending OTP...")
-        client = Client(f"session_{user_id}", api_id=API_ID, api_hash=API_HASH)
-        await client.connect()
+        return await (bot_client if link_type == "public" else user_client).get_messages(chat_id, message_id)
     except Exception as e:
-        await message.reply(f"❌ Failed to send OTP: {e}")
-        return
+        print(f"Message fetch error: {e}")
+        return None
 
+async def update_progress(current, total, client, chat_id, message_id, start_time):
+    """Update progress bar for active transfers"""
+    global progress_cache
+    progress_percent = (current / total) * 100
+    progress_step = int(progress_percent // 10) * 10
+
+    if message_id not in progress_cache or progress_cache[message_id] != progress_step or progress_percent >= 100:
+        progress_cache[message_id] = progress_step
+        progress_bar = "🟢" * (int(progress_percent // 10)) + "🔴" * (10 - int(progress_percent // 10))
+        
+        elapsed_time = time.time() - start_time
+        transfer_speed = (current / elapsed_time) / (1024 ** 2) if elapsed_time > 0 else 0
+        eta_seconds = (total - current) / (transfer_speed * 1024 ** 2) if transfer_speed > 0 else 0
+        eta_formatted = time.strftime("%M:%S", time.gmtime(eta_seconds))
+        
+        status_message = (
+            "__**Pyro Handler...**__\n\n"
+            f"{progress_bar}\n\n"
+            f"📊 **Completed**: {progress_percent:.2f}%\n"
+            f"🚀 **Speed**: {transfer_speed:.2f} MB/s\n"
+            f"⏳ **ETA**: {eta_formatted}\n\n"
+            "**Powered by Team SPY**"
+        )
+        
+        await client.edit_message_text(chat_id, message_id, status_message)
+        if progress_percent >= 100:
+            progress_cache.pop(message_id, None)
+
+async def handle_media_transfer(bot, user, message, dest_chat, link_type, user_id):
+    """Handle media file transfer between chats"""
     try:
-        code = await client.send_code(phone_number)
-    except Exception as e:
-        await message.reply(f"❌ Error: {e}")
-        return
+        if not message.media:
+            await bot.send_message(dest_chat, text=message.text.markdown)
+            return "Text message sent"
 
-    while True:
+        if link_type == "public":
+            await message.copy(dest_chat)
+            return "Media copied"
+
+        # Private chat handling
+        progress_msg = await bot.send_message(dest_chat, "⏬ Downloading...")
+        active_tasks[user_id] = {"cancel": False, "progress_id": progress_msg.id}
+        
+        start_time = time.time()
+        temp_file = await user.download_media(message, 
+            progress=update_progress,
+            progress_args=(bot, dest_chat, progress_msg.id, start_time)
+        
+        if active_tasks.get(user_id, {}).get("cancel"):
+            await bot.edit_message_text(dest_chat, progress_msg.id, "❌ Canceled")
+            if os_module.exists(temp_file):
+                os_module.remove(temp_file)
+            return "Canceled"
+
+        if not temp_file:
+            await bot.edit_message_text(dest_chat, progress_msg.id, "❌ Failed")
+            return "Failed"
+
+        await bot.edit_message_text(dest_chat, progress_msg.id, "⏫ Uploading...")
+        thumbnail = "v3.jpg"
+        
         try:
-            otp_code = await _.ask(user_id, "Please enter the OTP you received:", filters=filters.text, timeout=600)
-            phone_code = otp_code.text.replace(" ", "")
-            if phone_code.lower() == 'resend':
-                await client.send_code(phone_number)
-                continue
-            break
-        except TimeoutError:
-            await message.reply('⏰ Time limit exceeded. Please restart the session.')
-            return
+            media_args = {
+                "caption": message.caption.markdown if message.caption else None,
+                "progress": update_progress,
+                "progress_args": (bot, dest_chat, progress_msg.id, start_time)
+            }
+            
+            if message.video:
+                await bot.send_video(dest_chat, temp_file, thumb=thumbnail,
+                    width=message.video.width, height=message.video.height,
+                    duration=message.video.duration, **media_args)
+            elif message.video_note:
+                await bot.send_video_note(dest_chat, temp_file, **media_args)
+            elif message.voice:
+                await bot.send_voice(dest_chat, temp_file, **media_args)
+            elif message.sticker:
+                await bot.send_sticker(dest_chat, message.sticker.file_id)
+            elif message.audio:
+                await bot.send_audio(dest_chat, temp_file, thumb=thumbnail, **media_args)
+            elif message.photo:
+                await bot.send_photo(dest_chat, temp_file, **media_args)
+            elif message.document:
+                await bot.send_document(dest_chat, temp_file, **media_args)
+        finally:
+            if os_module.exists(temp_file):
+                os_module.remove(temp_file)
 
-    try:
-        await client.sign_in(phone_number, code.phone_code_hash, phone_code)
+        await bot.delete_messages(dest_chat, progress_msg.id)
+        return "Transfer completed"
+
     except Exception as e:
-        await message.reply(f"❌ Error: {e}")
+        return f"Error: {str(e)}"
+
+@bot_client.on_message(Filters.command("start"))
+async def start_command(client, message: TelegramMessage):
+    await message.reply_text("✨ Welcome! Use /batch to start transferring messages")
+
+@bot_client.on_message(Filters.command("batch"))
+async def batch_command(client, message: TelegramMessage):
+    user_id = message.from_user.id
+    user_states[user_id] = {"step": "start"}
+    await message.reply_text("📩 Send me the first message link")
+
+@bot_client.on_message(Filters.command("cancel"))
+async def cancel_command(client, message: TelegramMessage):
+    user_id = message.from_user.id
+    if user_id in active_tasks:
+        active_tasks[user_id]["cancel"] = True
+        await message.reply_text("🛑 Cancelling current task...")
+    else:
+        await message.reply_text("❌ No active tasks to cancel")
+
+@bot_client.on_message(Filters.text & ~Filters.command(["start", "batch", "cancel"]))
+async def handle_user_input(client, message: TelegramMessage):
+    user_id = message.from_user.id
+    if user_id not in user_states:
         return
 
-    string_session = await client.export_session_string()
-    await client.disconnect()
-    await message.reply(f"✅ Login successful!\n\nYour session string:\n`{string_session}`")
+    state = user_states[user_id]
+    current_step = state.get("step")
 
-@bot.on_message(filters.command("logout"))
-async def clear_session(_, message):
-    user_id = message.chat.id
-    session_file = f"session_{user_id}.session"
-    memory_file = f"session_{user_id}.session-journal"
+    if current_step == "start":
+        chat_id, start_id, link_type = parse_telegram_link(message.text)
+        if not chat_id or not start_id:
+            await message.reply_text("❌ Invalid link format")
+            del user_states[user_id]
+            return
 
-    if os.path.exists(session_file):
-        os.remove(session_file)
-    if os.path.exists(memory_file):
-        os.remove(memory_file)
+        user_states[user_id].update({
+            "step": "count",
+            "chat_id": chat_id,
+            "start_id": start_id,
+            "link_type": link_type
+        })
+        await message.reply_text("🔢 How many messages to transfer?")
 
-    await message.reply("✅ Logged out successfully!")
+    elif current_step == "count":
+        if not message.text.isdigit():
+            await message.reply_text("❌ Please enter a valid number")
+            return
 
-if __name__ == "__main__":
-    bot.start()
-    userbot.start()
-    print("Bot started successfully!")
-    bot.idle()
+        user_states[user_id].update({
+            "step": "destination",
+            "message_count": int(message.text)
+        })
+        await message.reply_text("📤 Enter destination chat ID")
+
+    elif current_step == "destination":
+        user_data = user_states[user_id]
+        chat_id = message.text.strip()
+        progress_msg = await message.reply_text("🚀 Processing messages...")
+
+        success_count = 0
+        for i in range(user_data["message_count"]):
+            current_id = user_data["start_id"] + i
+            msg = await fetch_message(client, user_data["chat_id"], current_id, user_data["link_type"])
+            
+            if not msg:
+                await message.reply_text(f"⚠️ Message {current_id} not found")
+                continue
+                
+            result = await handle_media_transfer(bot_client, user_client, msg, 
+                chat_id, user_data["link_type"], user_id)
+            await progress_msg.edit(f"📨 Message {i+1}: {result}")
+            if "completed" in result.lower():
+                success_count += 1
+
+        await message.reply_text(f"✅ Completed! {success_count}/{user_data['message_count']} messages transferred")
+        del user_states[user_id]
+
+print("✅ Bot started successfully")
+bot_client.run()

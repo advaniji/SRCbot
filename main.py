@@ -13,28 +13,29 @@ progress_cache = {}
 
 try:
     user_client.start()
-    print("User client started successfully")
+    print("✅ User client started successfully")
 except Exception as e:
-    print(f"Failed to start user client: {e}")
+    print(f"❌ Failed to start user client: {e}")
     exit(1)
 
 def parse_telegram_link(link):
     """Extract chat information from Telegram message link"""
-    private_chat_match = regex.match(r"https://t\.me/c/(\d+)/(\d+)", link)
-    public_chat_match = regex.match(r"https://t\.me/([^/]+)/(\d+)", link)
+    private_match = regex.match(r"https://t\.me/c/(\d+)/(\d+)", link)
+    public_match = regex.match(r"https://t\.me/([^/]+)/(\d+)", link)
     
-    if private_chat_match:
-        return f"-100{private_chat_match.group(1)}", int(private_chat_match.group(2)), "private"
-    if public_chat_match:
-        return public_chat_match.group(1), int(public_chat_match.group(2)), "public"
+    if private_match:
+        return f"-100{private_match.group(1)}", int(private_match.group(2)), "private"
+    if public_match:
+        return public_match.group(1), int(public_match.group(2)), "public"
     return None, None, None
-        
-async def fetch_message(client, chat_id, message_id, link_type):
+
+async def fetch_message(chat_id, message_id, link_type):
     """Retrieve message from specified chat"""
     try:
-        return await (bot_client if link_type == "public" else user_client).get_messages(chat_id, message_id)
+        client = bot_client if link_type == "public" else user_client
+        return await client.get_messages(chat_id, message_id)
     except Exception as e:
-        print(f"Message fetch error: {e}")
+        print(f"❌ Message fetch error: {e}")
         return None
 
 async def update_progress(current, total, client, chat_id, message_id, start_time):
@@ -65,11 +66,11 @@ async def update_progress(current, total, client, chat_id, message_id, start_tim
         if progress_percent >= 100:
             progress_cache.pop(message_id, None)
 
-async def handle_media_transfer(bot, user, message, dest_chat, link_type, user_id):
+async def handle_media_transfer(message, dest_chat, link_type, user_id):
     """Handle media file transfer between chats"""
     try:
         if not message.media:
-            await bot.send_message(dest_chat, text=message.text.markdown)
+            await bot_client.send_message(dest_chat, text=message.text.markdown)
             return "Text message sent"
 
         if link_type == "public":
@@ -77,72 +78,109 @@ async def handle_media_transfer(bot, user, message, dest_chat, link_type, user_i
             return "Media copied"
 
         # Private chat handling
-        progress_msg = await bot.send_message(dest_chat, "⏬ Downloading...")
+        progress_msg = await bot_client.send_message(dest_chat, "⏬ Downloading...")
         active_tasks[user_id] = {"cancel": False, "progress_id": progress_msg.id}
-        
         start_time = time.time()
-        temp_file = await user.download_media(message, 
-            progress=update_progress,
-            progress_args=(bot, dest_chat, progress_msg.id, start_time)
         
+        try:
+            temp_file = await user_client.download_media(
+                message,
+                progress=update_progress,
+                progress_args=(bot_client, dest_chat, progress_msg.id, start_time)
+            )
+        except Exception as e:
+            await progress_msg.edit(f"❌ Download failed: {str(e)}")
+            return "Download failed"
+
         if active_tasks.get(user_id, {}).get("cancel"):
-            await bot.edit_message_text(dest_chat, progress_msg.id, "❌ Canceled")
+            await progress_msg.edit("❌ Canceled")
             if os_module.exists(temp_file):
                 os_module.remove(temp_file)
             return "Canceled"
 
-        if not temp_file:
-            await bot.edit_message_text(dest_chat, progress_msg.id, "❌ Failed")
-            return "Failed"
-
-        await bot.edit_message_text(dest_chat, progress_msg.id, "⏫ Uploading...")
+        await progress_msg.edit("⏫ Uploading...")
         thumbnail = "v3.jpg"
-        
+        caption = message.caption.markdown if message.caption else None
+
         try:
-            media_args = {
-                "caption": message.caption.markdown if message.caption else None,
+            common_args = {
                 "progress": update_progress,
-                "progress_args": (bot, dest_chat, progress_msg.id, start_time)
+                "progress_args": (bot_client, dest_chat, progress_msg.id, start_time)
             }
-            
+
             if message.video:
-                await bot.send_video(dest_chat, temp_file, thumb=thumbnail,
-                    width=message.video.width, height=message.video.height,
-                    duration=message.video.duration, **media_args)
+                await bot_client.send_video(
+                    dest_chat,
+                    temp_file,
+                    thumb=thumbnail,
+                    width=message.video.width,
+                    height=message.video.height,
+                    duration=message.video.duration,
+                    caption=caption,
+                    **common_args
+                )
             elif message.video_note:
-                await bot.send_video_note(dest_chat, temp_file, **media_args)
+                await bot_client.send_video_note(
+                    dest_chat,
+                    temp_file,
+                    **common_args
+                )
             elif message.voice:
-                await bot.send_voice(dest_chat, temp_file, **media_args)
+                await bot_client.send_voice(
+                    dest_chat,
+                    temp_file,
+                    caption=caption,
+                    **common_args
+                )
             elif message.sticker:
-                await bot.send_sticker(dest_chat, message.sticker.file_id)
+                await bot_client.send_sticker(
+                    dest_chat,
+                    temp_file
+                )
             elif message.audio:
-                await bot.send_audio(dest_chat, temp_file, thumb=thumbnail, **media_args)
+                await bot_client.send_audio(
+                    dest_chat,
+                    temp_file,
+                    thumb=thumbnail,
+                    caption=caption,
+                    **common_args
+                )
             elif message.photo:
-                await bot.send_photo(dest_chat, temp_file, **media_args)
+                await bot_client.send_photo(
+                    dest_chat,
+                    temp_file,
+                    caption=caption,
+                    **common_args
+                )
             elif message.document:
-                await bot.send_document(dest_chat, temp_file, **media_args)
+                await bot_client.send_document(
+                    dest_chat,
+                    temp_file,
+                    caption=caption,
+                    **common_args
+                )
         finally:
             if os_module.exists(temp_file):
                 os_module.remove(temp_file)
 
-        await bot.delete_messages(dest_chat, progress_msg.id)
+        await bot_client.delete_messages(dest_chat, progress_msg.id)
         return "Transfer completed"
 
     except Exception as e:
-        return f"Error: {str(e)}"
+        return f"❌ Error: {str(e)}"
 
 @bot_client.on_message(Filters.command("start"))
-async def start_command(client, message: TelegramMessage):
+async def start_handler(_, message: TelegramMessage):
     await message.reply_text("✨ Welcome! Use /batch to start transferring messages")
 
 @bot_client.on_message(Filters.command("batch"))
-async def batch_command(client, message: TelegramMessage):
+async def batch_handler(_, message: TelegramMessage):
     user_id = message.from_user.id
     user_states[user_id] = {"step": "start"}
     await message.reply_text("📩 Send me the first message link")
 
 @bot_client.on_message(Filters.command("cancel"))
-async def cancel_command(client, message: TelegramMessage):
+async def cancel_handler(_, message: TelegramMessage):
     user_id = message.from_user.id
     if user_id in active_tasks:
         active_tasks[user_id]["cancel"] = True
@@ -151,7 +189,7 @@ async def cancel_command(client, message: TelegramMessage):
         await message.reply_text("❌ No active tasks to cancel")
 
 @bot_client.on_message(Filters.text & ~Filters.command(["start", "batch", "cancel"]))
-async def handle_user_input(client, message: TelegramMessage):
+async def message_handler(_, message: TelegramMessage):
     user_id = message.from_user.id
     if user_id not in user_states:
         return
@@ -187,20 +225,28 @@ async def handle_user_input(client, message: TelegramMessage):
 
     elif current_step == "destination":
         user_data = user_states[user_id]
-        chat_id = message.text.strip()
+        dest_chat = message.text.strip()
         progress_msg = await message.reply_text("🚀 Processing messages...")
 
         success_count = 0
         for i in range(user_data["message_count"]):
             current_id = user_data["start_id"] + i
-            msg = await fetch_message(client, user_data["chat_id"], current_id, user_data["link_type"])
+            msg = await fetch_message(
+                user_data["chat_id"],
+                current_id,
+                user_data["link_type"]
+            )
             
             if not msg:
                 await message.reply_text(f"⚠️ Message {current_id} not found")
                 continue
                 
-            result = await handle_media_transfer(bot_client, user_client, msg, 
-                chat_id, user_data["link_type"], user_id)
+            result = await handle_media_transfer(
+                msg,
+                dest_chat,
+                user_data["link_type"],
+                user_id
+            )
             await progress_msg.edit(f"📨 Message {i+1}: {result}")
             if "completed" in result.lower():
                 success_count += 1

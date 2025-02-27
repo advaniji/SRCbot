@@ -288,7 +288,7 @@ async def help_command(client: Client, message: Message):
         "1️⃣ Use /batch to start forwarding messages\n"
         "2️⃣ Send the source message link\n"
         "3️⃣ Specify how many messages to forward\n"
-        "4️⃣ Provide the destination chat ID\n\n"
+        "4️⃣ Files will be sent to this chat\n\n"
         "**Other commands:**\n"
         "• /cancel - Stop current operation\n"
         "• /status - Check bot status\n\n"
@@ -516,8 +516,19 @@ async def handle_text(client: Client, message: Message):
                 "step": "destination",
                 "count": min(int(text), MAX_MESSAGES)
             })
-            await message.reply("📩 Please send destination chat ID:")
+            # Use the current chat ID as the destination
+            dest_chat = message.chat.id
+            await message.reply("📩 Starting the forwarding process...")
             
         elif state["step"] == "destination":
-            dest_chat = text.strip()
-    
+            # Use the current chat ID as the destination
+            dest_chat = message.chat.id
+            # Proceed to handle the media forwarding
+            await message.reply("📤 Uploading files to this chat...")
+            
+    except Exception as e:
+        logger.error(f"An error occurred: {e}")
+        await message.reply("⚠️ An error occurred during processing. Please try again.")
+    finally:
+        # Optional: Code to execute regardless of exceptions
+        pass

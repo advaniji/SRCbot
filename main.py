@@ -1,7 +1,7 @@
 import os
 import re
 import time
-from pyrogram import Client, filters
+from pyrogram import Client, filters, idle
 from pyrogram.types import Message
 from pyrogram.errors import SessionPasswordNeeded
 
@@ -31,11 +31,6 @@ async def start_user_client():
             print("✅ User client started successfully")
         except Exception as e:
             print(f"❌ Failed to start user client: {e}")
-
-if SESSION_STRING:
-    bot_client.run(start_user_client())
-else:
-    print("ℹ️ No session string found. Use /login to create one")
 
 def parse_telegram_link(link):
     private_match = re.match(r"https://t\.me/c/(\d+)/(\d+)", link)
@@ -85,7 +80,8 @@ async def update_progress(current, total, client, chat_id, message_id, start_tim
 async def handle_media_transfer(message, dest_chat, link_type, user_id):
     try:
         if not message.media:
-            await bot_client.send_message(dest_chat, text=message.text.markdown)
+            # Send text message (using markdown parse mode)
+            await bot_client.send_message(dest_chat, text=message.text, parse_mode="markdown")
             return "Text message sent"
 
         if link_type == "public":
@@ -95,25 +91,26 @@ async def handle_media_transfer(message, dest_chat, link_type, user_id):
         progress_msg = await bot_client.send_message(dest_chat, "⏬ Downloading...")
         active_tasks[user_id] = {"cancel": False, "progress_id": progress_msg.id}
         start_time = time.time()
-        
+        temp_file = None
         try:
             temp_file = await user_client.download_media(
                 message,
                 progress=update_progress,
                 progress_args=(bot_client, dest_chat, progress_msg.id, start_time)
+            )
         except Exception as e:
-            await progress_msg.edit(f"❌ Download failed: {str(e)}")
+            await progress_msg.edit_text(f"❌ Download failed: {str(e)}")
             return "Download failed"
 
         if active_tasks.get(user_id, {}).get("cancel"):
-            await progress_msg.edit("❌ Canceled")
-            if os.path.exists(temp_file):
+            await progress_msg.edit_text("❌ Canceled")
+            if temp_file and os.path.exists(temp_file):
                 os.remove(temp_file)
             return "Canceled"
 
-        await progress_msg.edit("⏫ Uploading...")
+        await progress_msg.edit_text("⏫ Uploading...")
         thumbnail = "v3.jpg"
-        caption = message.caption.markdown if message.caption else None
+        caption = message.caption if message.caption else None
 
         try:
             common_args = {
@@ -145,7 +142,7 @@ async def handle_media_transfer(message, dest_chat, link_type, user_id):
             elif message.document:
                 await bot_client.send_document(dest_chat, temp_file, caption=caption, **common_args)
         finally:
-            if os.path.exists(temp_file):
+            if temp_file and os.path.exists(temp_file):
                 os.remove(temp_file)
 
         await bot_client.delete_messages(dest_chat, progress_msg.id)
@@ -320,12 +317,19 @@ async def message_handler(_, message: Message):
                 user_data["link_type"],
                 user_id
             )
-            await progress_msg.edit(f"📨 Message {i+1}: {result}")
+            await progress_msg.edit_text(f"📨 Message {i+1}: {result}")
             if "completed" in result.lower():
                 success_count += 1
 
         await message.reply_text(f"✅ Completed! {success_count}/{user_data['message_count']} messages transferred")
         del user_states[user_id]
 
-print("✅ Bot started successfully")
-bot_client.run()
+async def main():
+    if SESSION_STRING and user_client:
+        await start_user_client()
+    else:
+        print("ℹ️ No session string found. Use /login to create one")
+    print("✅ Bot started successfully")
+    await idle()
+
+bot_client.run(main())

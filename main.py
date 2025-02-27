@@ -1,15 +1,23 @@
-import os as os_module, re as regex
-from pyrogram import Client as TelegramClient, filters as Filters
-from pyrogram.types import Message as TelegramMessage
-from pyrogram.errors import SessionPasswordNeeded
+import os
+import re
 import time
-from config import API_ID, API_HASH, BOT_TOKEN, SESSION_STRING
+from pyrogram import Client, filters
+from pyrogram.types import Message
+from pyrogram.errors import SessionPasswordNeeded
 
-bot_client = TelegramClient("bot", API_ID, API_HASH, bot_token=BOT_TOKEN)
+# Configuration from environment variables
+API_ID = int(os.environ.get("API_ID"))
+API_HASH = os.environ.get("API_HASH")
+BOT_TOKEN = os.environ.get("BOT_TOKEN")
+SESSION_STRING = os.environ.get("SESSION_STRING", "")
+
+# Initialize clients
+bot_client = Client("bot", API_ID, API_HASH, bot_token=BOT_TOKEN)
 user_client = None
 if SESSION_STRING:
-    user_client = TelegramClient("user", API_ID, API_HASH, session_string=SESSION_STRING)
+    user_client = Client("user", API_ID, API_HASH, session_string=SESSION_STRING)
 
+# State management
 user_states = {}
 active_tasks = {}
 progress_cache = {}
@@ -30,8 +38,8 @@ else:
     print("ℹ️ No session string found. Use /login to create one")
 
 def parse_telegram_link(link):
-    private_match = regex.match(r"https://t\.me/c/(\d+)/(\d+)", link)
-    public_match = regex.match(r"https://t\.me/([^/]+)/(\d+)", link)
+    private_match = re.match(r"https://t\.me/c/(\d+)/(\d+)", link)
+    public_match = re.match(r"https://t\.me/([^/]+)/(\d+)", link)
     
     if private_match:
         return f"-100{private_match.group(1)}", int(private_match.group(2)), "private"
@@ -93,15 +101,14 @@ async def handle_media_transfer(message, dest_chat, link_type, user_id):
                 message,
                 progress=update_progress,
                 progress_args=(bot_client, dest_chat, progress_msg.id, start_time)
-            )
         except Exception as e:
             await progress_msg.edit(f"❌ Download failed: {str(e)}")
             return "Download failed"
 
         if active_tasks.get(user_id, {}).get("cancel"):
             await progress_msg.edit("❌ Canceled")
-            if os_module.exists(temp_file):
-                os_module.remove(temp_file)
+            if os.path.exists(temp_file):
+                os.remove(temp_file)
             return "Canceled"
 
         await progress_msg.edit("⏫ Uploading...")
@@ -138,8 +145,8 @@ async def handle_media_transfer(message, dest_chat, link_type, user_id):
             elif message.document:
                 await bot_client.send_document(dest_chat, temp_file, caption=caption, **common_args)
         finally:
-            if os_module.exists(temp_file):
-                os_module.remove(temp_file)
+            if os.path.exists(temp_file):
+                os.remove(temp_file)
 
         await bot_client.delete_messages(dest_chat, progress_msg.id)
         return "Transfer completed"
@@ -147,18 +154,23 @@ async def handle_media_transfer(message, dest_chat, link_type, user_id):
     except Exception as e:
         return f"❌ Error: {str(e)}"
 
-@bot_client.on_message(Filters.command("start"))
-async def start_handler(_, message: TelegramMessage):
-    await message.reply_text("✨ Welcome! Use /batch to start transferring messages or /login to create a session")
+@bot_client.on_message(filters.command("start"))
+async def start_handler(_, message: Message):
+    await message.reply_text(
+        "✨ Welcome!\n"
+        "- Use /batch to start transferring messages\n"
+        "- Use /login to create a session\n"
+        "- Use /cancel to stop current task"
+    )
 
-@bot_client.on_message(Filters.command("login"))
-async def login_handler(_, message: TelegramMessage):
+@bot_client.on_message(filters.command("login"))
+async def login_handler(_, message: Message):
     user_id = message.from_user.id
     login_sessions[user_id] = {"stage": "phone"}
     await message.reply("Please send your phone number in international format (+1234567890):")
 
-@bot_client.on_message(Filters.command("batch"))
-async def batch_handler(_, message: TelegramMessage):
+@bot_client.on_message(filters.command("batch"))
+async def batch_handler(_, message: Message):
     if not user_client:
         await message.reply("❌ No active session! Use /login first")
         return
@@ -167,8 +179,8 @@ async def batch_handler(_, message: TelegramMessage):
     user_states[user_id] = {"step": "start"}
     await message.reply_text("📩 Send me the first message link")
 
-@bot_client.on_message(Filters.command("cancel"))
-async def cancel_handler(_, message: TelegramMessage):
+@bot_client.on_message(filters.command("cancel"))
+async def cancel_handler(_, message: Message):
     user_id = message.from_user.id
     if user_id in active_tasks:
         active_tasks[user_id]["cancel"] = True
@@ -176,8 +188,8 @@ async def cancel_handler(_, message: TelegramMessage):
     else:
         await message.reply_text("❌ No active tasks to cancel")
 
-@bot_client.on_message(Filters.text & ~Filters.command(["start", "batch", "cancel", "login"]))
-async def message_handler(_, message: TelegramMessage):
+@bot_client.on_message(filters.text & ~filters.command(["start", "batch", "cancel", "login"]))
+async def message_handler(_, message: Message):
     user_id = message.from_user.id
     
     # Handle login process
@@ -186,7 +198,7 @@ async def message_handler(_, message: TelegramMessage):
         
         if login_data["stage"] == "phone":
             phone_number = message.text
-            temp_client = TelegramClient(f"session_{user_id}", API_ID, API_HASH)
+            temp_client = Client(f"session_{user_id}", API_ID, API_HASH)
             await temp_client.connect()
             
             try:
@@ -227,7 +239,7 @@ async def message_handler(_, message: TelegramMessage):
             await message.reply(
                 f"✅ Login successful!\n"
                 f"Your session string:\n`{session_string}`\n\n"
-                "Update your SESSION_STRING in config and restart the bot!"
+                "Update your SESSION_STRING environment variable and restart the bot!"
             )
             del login_sessions[user_id]
         
@@ -241,7 +253,7 @@ async def message_handler(_, message: TelegramMessage):
                 await message.reply(
                     f"✅ Login successful!\n"
                     f"Your session string:\n`{session_string}`\n\n"
-                    "Update your SESSION_STRING in config and restart the bot!"
+                    "Update your SESSION_STRING environment variable and restart the bot!"
                 )
             except Exception as e:
                 await message.reply(f"❌ 2FA failed: {str(e)}")

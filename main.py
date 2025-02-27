@@ -1,25 +1,35 @@
 import os as os_module, re as regex
 from pyrogram import Client as TelegramClient, filters as Filters
 from pyrogram.types import Message as TelegramMessage
+from pyrogram.errors import SessionPasswordNeeded
 import time
 from config import API_ID, API_HASH, BOT_TOKEN, SESSION_STRING
 
 bot_client = TelegramClient("bot", API_ID, API_HASH, bot_token=BOT_TOKEN)
-user_client = TelegramClient("user", API_ID, API_HASH, session_string=SESSION_STRING)
+user_client = None
+if SESSION_STRING:
+    user_client = TelegramClient("user", API_ID, API_HASH, session_string=SESSION_STRING)
 
 user_states = {}
 active_tasks = {}
 progress_cache = {}
+login_sessions = {}
 
-try:
-    user_client.start()
-    print("✅ User client started successfully")
-except Exception as e:
-    print(f"❌ Failed to start user client: {e}")
-    exit(1)
+async def start_user_client():
+    global user_client
+    if SESSION_STRING and user_client:
+        try:
+            await user_client.start()
+            print("✅ User client started successfully")
+        except Exception as e:
+            print(f"❌ Failed to start user client: {e}")
+
+if SESSION_STRING:
+    bot_client.run(start_user_client())
+else:
+    print("ℹ️ No session string found. Use /login to create one")
 
 def parse_telegram_link(link):
-    """Extract chat information from Telegram message link"""
     private_match = regex.match(r"https://t\.me/c/(\d+)/(\d+)", link)
     public_match = regex.match(r"https://t\.me/([^/]+)/(\d+)", link)
     
@@ -30,7 +40,6 @@ def parse_telegram_link(link):
     return None, None, None
 
 async def fetch_message(chat_id, message_id, link_type):
-    """Retrieve message from specified chat"""
     try:
         client = bot_client if link_type == "public" else user_client
         return await client.get_messages(chat_id, message_id)
@@ -39,7 +48,6 @@ async def fetch_message(chat_id, message_id, link_type):
         return None
 
 async def update_progress(current, total, client, chat_id, message_id, start_time):
-    """Update progress bar for active transfers"""
     global progress_cache
     progress_percent = (current / total) * 100
     progress_step = int(progress_percent // 10) * 10
@@ -67,7 +75,6 @@ async def update_progress(current, total, client, chat_id, message_id, start_tim
             progress_cache.pop(message_id, None)
 
 async def handle_media_transfer(message, dest_chat, link_type, user_id):
-    """Handle media file transfer between chats"""
     try:
         if not message.media:
             await bot_client.send_message(dest_chat, text=message.text.markdown)
@@ -77,7 +84,6 @@ async def handle_media_transfer(message, dest_chat, link_type, user_id):
             await message.copy(dest_chat)
             return "Media copied"
 
-        # Private chat handling
         progress_msg = await bot_client.send_message(dest_chat, "⏬ Downloading...")
         active_tasks[user_id] = {"cancel": False, "progress_id": progress_msg.id}
         start_time = time.time()
@@ -120,45 +126,17 @@ async def handle_media_transfer(message, dest_chat, link_type, user_id):
                     **common_args
                 )
             elif message.video_note:
-                await bot_client.send_video_note(
-                    dest_chat,
-                    temp_file,
-                    **common_args
-                )
+                await bot_client.send_video_note(dest_chat, temp_file, **common_args)
             elif message.voice:
-                await bot_client.send_voice(
-                    dest_chat,
-                    temp_file,
-                    caption=caption,
-                    **common_args
-                )
+                await bot_client.send_voice(dest_chat, temp_file, caption=caption, **common_args)
             elif message.sticker:
-                await bot_client.send_sticker(
-                    dest_chat,
-                    temp_file
-                )
+                await bot_client.send_sticker(dest_chat, temp_file)
             elif message.audio:
-                await bot_client.send_audio(
-                    dest_chat,
-                    temp_file,
-                    thumb=thumbnail,
-                    caption=caption,
-                    **common_args
-                )
+                await bot_client.send_audio(dest_chat, temp_file, thumb=thumbnail, caption=caption, **common_args)
             elif message.photo:
-                await bot_client.send_photo(
-                    dest_chat,
-                    temp_file,
-                    caption=caption,
-                    **common_args
-                )
+                await bot_client.send_photo(dest_chat, temp_file, caption=caption, **common_args)
             elif message.document:
-                await bot_client.send_document(
-                    dest_chat,
-                    temp_file,
-                    caption=caption,
-                    **common_args
-                )
+                await bot_client.send_document(dest_chat, temp_file, caption=caption, **common_args)
         finally:
             if os_module.exists(temp_file):
                 os_module.remove(temp_file)
@@ -171,10 +149,20 @@ async def handle_media_transfer(message, dest_chat, link_type, user_id):
 
 @bot_client.on_message(Filters.command("start"))
 async def start_handler(_, message: TelegramMessage):
-    await message.reply_text("✨ Welcome! Use /batch to start transferring messages")
+    await message.reply_text("✨ Welcome! Use /batch to start transferring messages or /login to create a session")
+
+@bot_client.on_message(Filters.command("login"))
+async def login_handler(_, message: TelegramMessage):
+    user_id = message.from_user.id
+    login_sessions[user_id] = {"stage": "phone"}
+    await message.reply("Please send your phone number in international format (+1234567890):")
 
 @bot_client.on_message(Filters.command("batch"))
 async def batch_handler(_, message: TelegramMessage):
+    if not user_client:
+        await message.reply("❌ No active session! Use /login first")
+        return
+    
     user_id = message.from_user.id
     user_states[user_id] = {"step": "start"}
     await message.reply_text("📩 Send me the first message link")
@@ -188,9 +176,82 @@ async def cancel_handler(_, message: TelegramMessage):
     else:
         await message.reply_text("❌ No active tasks to cancel")
 
-@bot_client.on_message(Filters.text & ~Filters.command(["start", "batch", "cancel"]))
+@bot_client.on_message(Filters.text & ~Filters.command(["start", "batch", "cancel", "login"]))
 async def message_handler(_, message: TelegramMessage):
     user_id = message.from_user.id
+    
+    # Handle login process
+    if user_id in login_sessions:
+        login_data = login_sessions[user_id]
+        
+        if login_data["stage"] == "phone":
+            phone_number = message.text
+            temp_client = TelegramClient(f"session_{user_id}", API_ID, API_HASH)
+            await temp_client.connect()
+            
+            try:
+                sent_code = await temp_client.send_code(phone_number)
+                login_sessions[user_id] = {
+                    "stage": "code",
+                    "temp_client": temp_client,
+                    "phone_number": phone_number,
+                    "phone_code_hash": sent_code.phone_code_hash
+                }
+                await message.reply("Enter the code you received (format: 1 2 3 4 5):")
+            except Exception as e:
+                await message.reply(f"❌ Error: {str(e)}")
+                del login_sessions[user_id]
+        
+        elif login_data["stage"] == "code":
+            code = message.text.replace(" ", "")
+            temp_client = login_data["temp_client"]
+            
+            try:
+                await temp_client.sign_in(
+                    login_data["phone_number"],
+                    login_data["phone_code_hash"],
+                    code
+                )
+            except SessionPasswordNeeded:
+                login_sessions[user_id]["stage"] = "password"
+                await message.reply("Enter your 2FA password:")
+                return
+            except Exception as e:
+                await message.reply(f"❌ Login failed: {str(e)}")
+                await temp_client.disconnect()
+                del login_sessions[user_id]
+                return
+            
+            session_string = await temp_client.export_session_string()
+            await temp_client.disconnect()
+            await message.reply(
+                f"✅ Login successful!\n"
+                f"Your session string:\n`{session_string}`\n\n"
+                "Update your SESSION_STRING in config and restart the bot!"
+            )
+            del login_sessions[user_id]
+        
+        elif login_data["stage"] == "password":
+            password = message.text
+            temp_client = login_data["temp_client"]
+            
+            try:
+                await temp_client.check_password(password)
+                session_string = await temp_client.export_session_string()
+                await message.reply(
+                    f"✅ Login successful!\n"
+                    f"Your session string:\n`{session_string}`\n\n"
+                    "Update your SESSION_STRING in config and restart the bot!"
+                )
+            except Exception as e:
+                await message.reply(f"❌ 2FA failed: {str(e)}")
+            finally:
+                await temp_client.disconnect()
+                del login_sessions[user_id]
+        
+        return
+    
+    # Handle normal message processing
     if user_id not in user_states:
         return
 
